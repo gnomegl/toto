@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+
+# @describe TOTO API client for crypto socials on X/Twitter
+# @arg command "Command to run" [string]
+# @arg value "Username, list ID, or other identifier" [string]
+# @option -k --key "TOTO API key (can also use TOTO_API_KEY env var)" [string]
+# @option -h --how "Lookup method: username or userid" [string] @default "username"
+# @option -p --page "Page number for pagination" [int] @default "1"
+# @option -n --num-rows "Number of rows to return (max 100)" [int] @default "100"
+# @option -s --since "Filter results since this datetime or ID" [string]
+# @option -t --tweet-ids "Comma-separated list of tweet IDs (max 20)" [string]
+# @flag   -w --with-pfp "Include profile image (increases latency)"
+# @flag   -j --json "Output raw JSON instead of formatted results"
+# @flag   -q --quiet "Suppress colored output"
+# @flag   -v --verbose "Show detailed request information"
+# @meta require-tools curl,jq
+
+eval "$(argc --argc-eval "$0" "$@")"
+
+setup_colors() {
+  if [ "$argc_quiet" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+    bold="" reset="" blue="" green="" yellow="" cyan="" magenta="" red="" dim=""
+  else
+    bold=$(tput bold) reset=$(tput sgr0) blue=$(tput setaf 4) green=$(tput setaf 2)
+    yellow=$(tput setaf 3) cyan=$(tput setaf 6) magenta=$(tput setaf 5) red=$(tput setaf 1)
+    dim=$(tput dim)
+  fi
+}
+setup_colors
+
+get_api_key() {
+  if [ -n "$argc_key" ]; then
+    echo "$argc_key"
+  elif [ -n "$TOTO_API_KEY" ]; then
+    echo "$TOTO_API_KEY"
+  elif [ -f "$HOME/.config/toto/api_key" ]; then
+    cat "$HOME/.config/toto/api_key"
+  else
+    echo "${red}Error:${reset} No TOTO API key found." >&2
+    echo "Either:" >&2
+    echo "  1. Pass it with --key" >&2
+    echo "  2. Set TOTO_API_KEY environment variable" >&2
+    echo "  3. Save it to ~/.config/toto/api_key" >&2
+    exit 1
+  fi
+}
+API_KEY=$(get_api_key)
+API_BASE="https://toto.oz.xyz/api"
+
+print_kv() {
+  printf "${bold}%s:${reset} %s\n" "$1" "$2"
+}
+
+print_section() {
+  printf "\n${bold}%s:${reset}\n" "$1"
+}
+
+print_divider() {
+  printf "${dim}%s${reset}\n" "$(printf '─%.0s' {1..80})"
+}
+
+format_timestamp() {
+  local timestamp="$1"
+  if [ -z "$timestamp" ] || [ "$timestamp" = "null" ] || [ "$timestamp" = "N/A" ]; then
+    echo "N/A"
+    return
+  fi
+
+  # Handle both Unix timestamps and ISO dates
+  if [[ "$timestamp" =~ ^[0-9]+$ ]]; then
+    # Unix timestamp
+    if command -v date >/dev/null 2>&1; then
+      if date -d "@$timestamp" >/dev/null 2>&1; then
+        date -d "@$timestamp" "+%Y-%m-%d %H:%M:%S UTC"
+      elif date -r "$timestamp" >/dev/null 2>&1; then
+        date -r "$timestamp" "+%Y-%m-%d %H:%M:%S UTC"
+      else
+        echo "$timestamp"
+      fi
+    else
+      echo "$timestamp"
+    fi
+  else
+    # ISO date string
+    echo "$timestamp"
+  fi
+}
+
+format_number() {
+  local num="$1"
+  if [ -z "$num" ] || [ "$num" = "null" ] || [ "$num" = "N/A" ]; then
+    echo "N/A"
+    return
+  fi
+
+  # add thousand separators for readability
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --grouping "$num" 2>/dev/null || echo "$num"
+  else
+    echo "$num" | sed ':a;s/\B[0-9]\{3\}\>/,&/;ta'
+  fi
+}
+
+make_request() {
+  local method="$1"
+  local endpoint="$2"
+  local data="$3"
+  local url="${API_BASE}/${endpoint}"
+
+  [ "$argc_verbose" = 1 ] && printf "${dim}%s %s${reset}\n" "$method" "$url" >&2
+
+  local response
+  if [ "$method" = "GET" ]; then
+    response=$(curl -s -H "x-api-key: ${API_KEY}" -H "accept: application/json" "$url")
+  else
+    [ "$argc_verbose" = 1 ] && printf "${dim}Payload: %s${reset}\n" "$data" >&2
+    response=$(curl -s -X "$method" \
+      -H "x-api-key: ${API_KEY}" \
+      -H "accept: application/json" \
+      -H "Content-Type: application/json" \
+      -d "$data" \
+      "$url")
+  fi
+
+  local curl_exit_code=$?
+  if [ $curl_exit_code -ne 0 ]; then
+    printf "${red}Error:${reset} Request failed (curl exit code: %d)\n" "$curl_exit_code" >&2
+    exit 1
+  fi
+
+  if [ -z "$response" ]; then
+    printf "${red}Error:${reset} Empty response from API\n" >&2
+    exit 1
+  fi
+
+  if ! echo "$response" | jq empty 2>/dev/null; then
+    printf "${red}Error:${reset} Invalid JSON response from API\n" >&2
+    echo "Response: $response" >&2
+    exit 1
+  fi
+
+  if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+    error_msg=$(echo "$response" | jq -r '.error // .message // "Unknown error"')
+    printf "${red}Error:${reset} TOTO API returned: ${red}%s${reset}\n" "$error_msg" >&2
+    exit 1
+  fi
+
+  echo "$response"
+}
+
+build_user_payload() {
+  local user="$1"
+  local how="${argc_how:-username}"
+  local page="${argc_page:-1}"
+
+  if [ -z "$user" ]; then
+    echo "${red}Error:${reset} User parameter is required" >&2
+    exit 1
+  fi
+
+  if [ "$page" -lt 1 ]; then
+    echo "${red}Error:${reset} Page number must be >= 1" >&2
+    exit 1
+  fi
+
+  local payload="{\"user\": \"$user\", \"how\": \"$how\", \"page\": $page"
+  [ "$argc_with_pfp" = 1 ] && payload="$payload, \"with_pfp\": true"
+  [ -n "$argc_since" ] && payload="$payload, \"since\": \"$argc_since\""
+  payload="$payload}"
+  echo "$payload"
+}
+
+show_help() {
+  echo "${bold}TOTO API Client${reset}"
+  echo ""
+  echo "${bold}Commands:${reset}"
+  echo ""
+  echo "${cyan}Account & Info:${reset}"
+  echo "  ${green}account${reset}              Show account information"
+  echo "  ${green}info${reset}                 Show API information"
+  echo ""
+  echo "${cyan}Alpha (Scoring):${reset}"
+  echo "  ${green}classification${reset} <user> Get classification for username"
+  echo "  ${green}score${reset} <user>          Get latest score for user"
+  echo "  ${green}score-history${reset} <user>  Get score history for user"
+  echo ""
+  echo "${cyan}Metadata:${reset}"
+  echo "  ${green}bio-history${reset} <user>    Get bio history for user"
+  echo "  ${green}current-metadata${reset} <user> Get current metadata for user"
+  echo "  ${green}metadata-history${reset} <user> Get metadata history for user"
+  echo "  ${green}follower-count${reset} <user>  Get follower count for user"
+  echo "  ${green}following-count${reset} <user> Get following count for user"
+  echo "  ${green}tweet-count${reset} <user>    Get tweet count for user"
+  echo "  ${green}latest-metadata${reset} <user> Get latest metadata for user"
+  echo "  ${green}userid${reset} <user>         Get Twitter user ID"
+  echo "  ${green}past-usernames${reset} <user> Get previous usernames"
+  echo "  ${green}deleted-tweets${reset} <user> Get deleted tweets"
+  echo ""
+  echo "${cyan}Tweets:${reset}"
+  echo "  ${green}tweets${reset} <user>         Get tweets for user"
+  echo "  ${green}latest-tweets${reset} <user>  Get latest tweets for user"
+  echo "  ${green}tweets-by-ids${reset}         Get tweets by IDs (use --tweet-ids)"
+  echo ""
+  echo "${cyan}Graph:${reset}"
+  echo "  ${green}first-followers${reset} <user> Get first followers"
+  echo "  ${green}followers${reset} <user>      Get followers"
+  echo "  ${green}following${reset} <user>      Get following"
+  echo "  ${green}scored-followers${reset} <user> Get scored followers"
+  echo ""
+  echo "${cyan}Lists:${reset}"
+  echo "  ${green}list-members${reset} <list_id> Get list members"
+  echo "  ${green}list-tweets${reset} <list_id>  Get latest tweets from list"
+  echo ""
+  echo "${cyan}Cyclone (Data Stream):${reset}"
+  echo "  ${green}cyclone-tweets${reset}       Get recent tweets from scraper"
+  echo ""
+  echo "${bold}Examples:${reset}"
+  echo "  ${green}$(basename "$0") score elonmusk${reset}"
+  echo "  ${green}$(basename "$0") past-usernames oz_dao${reset}"
+  echo "  ${green}$(basename "$0") followers --page 2 --since 2024-01-01 vitalikbuterin${reset}"
+  echo "  ${green}$(basename "$0") tweets-by-ids --tweet-ids 1814700231184744471,1814700231184744472${reset}"
+  echo "  ${green}$(basename "$0") cyclone-tweets --num-rows 50${reset}"
+  echo ""
+  echo "${bold}Options:${reset}"
+  echo "  ${yellow}-k, --key${reset}         TOTO API key"
+  echo "  ${yellow}-h, --how${reset}         Lookup method (username or userid)"
+  echo "  ${yellow}-p, --page${reset}        Page number for pagination"
+  echo "  ${yellow}-n, --num-rows${reset}    Number of rows to return (max 100)"
+  echo "  ${yellow}-s, --since${reset}       Filter results since datetime/ID"
+  echo "  ${yellow}-t, --tweet-ids${reset}   Comma-separated tweet IDs"
+  echo "  ${yellow}-w, --with-pfp${reset}    Include profile images"
+  echo "  ${yellow}-j, --json${reset}        Output raw JSON"
+  echo "  ${yellow}-q, --quiet${reset}       Suppress colored output"
+  echo "  ${yellow}-v, --verbose${reset}     Show detailed request information"
+}
+
+format_account() {
+  local response="$1"
+  local username=$(echo "$response" | jq -r '.username // "N/A"')
+  local credits=$(echo "$response" | jq -r '.credits // "N/A"')
+  local plan=$(echo "$response" | jq -r '.plan // "N/A"')
+
+  printf "${bold}Account Information${reset}\n"
+  print_divider
+  print_kv "Username" "${green}${username}${reset}"
+  print_kv "Credits" "${yellow}$(format_number "$credits")${reset}"
+  print_kv "Plan" "${cyan}${plan}${reset}"
+}
+
+format_user_metadata() {
+  local response="$1"
+  local username=$(echo "$response" | jq -r '.username // "N/A"')
+  local display_name=$(echo "$response" | jq -r '.display_name // "N/A"')
+  local bio=$(echo "$response" | jq -r '.bio // "N/A"')
+  local followers=$(echo "$response" | jq -r '.followers_count // "N/A"')
+  local following=$(echo "$response" | jq -r '.following_count // "N/A"')
+  local tweets=$(echo "$response" | jq -r '.tweets_count // "N/A"')
+  local verified=$(echo "$response" | jq -r '.verified // false')
+  local created_at=$(echo "$response" | jq -r '.created_at // "N/A"')
+  local location=$(echo "$response" | jq -r '.location // "N/A"')
+  local website=$(echo "$response" | jq -r '.website // "N/A"')
+
+  printf "${bold}User: ${green}@%s${reset}\n" "$username"
+  print_divider
+  [ "$display_name" != "N/A" ] && print_kv "Display Name" "${blue}${display_name}${reset}"
+  [ "$bio" != "N/A" ] && print_kv "Bio" "$bio"
+  [ "$location" != "N/A" ] && print_kv "Location" "${magenta}${location}${reset}"
+  [ "$website" != "N/A" ] && print_kv "Website" "${blue}${website}${reset}"
+
+  print_section "Statistics"
+  printf "  ${cyan}Followers:${reset} ${yellow}%s${reset}\n" "$(format_number "$followers")"
+  printf "  ${cyan}Following:${reset} ${yellow}%s${reset}\n" "$(format_number "$following")"
+  printf "  ${cyan}Tweets:${reset} ${yellow}%s${reset}\n" "$(format_number "$tweets")"
+  printf "  ${cyan}Verified:${reset} %s\n" "$([ "$verified" = "true" ] && echo "${green}✓ Yes${reset}" || echo "${red}✗ No${reset}")"
+  [ "$created_at" != "N/A" ] && printf "  ${cyan}Created:${reset} ${yellow}%s${reset}\n" "$(format_timestamp "$created_at")"
+}
+
+format_tweets() {
+  local response="$1"
+  local count=$(echo "$response" | jq -r '. | length')
+
+  printf "${bold}Tweets${reset} ${dim}(${yellow}%s${dim} found)${reset}\n" "$count"
+  print_divider
+
+  echo "$response" | jq -r '.[] | "\(.id)|\(.text)|\(.created_at)|\(.retweet_count // 0)|\(.favorite_count // 0)|\(.reply_count // 0)"' |
+    while IFS="|" read -r tweet_id text created_at retweets likes replies; do
+      printf "\n${bold}${cyan}%s${reset} ${dim}•${reset} ${yellow}%s${reset}\n" "$tweet_id" "$(format_timestamp "$created_at")"
+
+      # format tweet text with word wrapping
+      printf "%s\n" "$text" | fold -w 80 -s
+
+      printf "\n${dim}Stats:${reset} "
+      printf "${green}%s${reset} retweets" "$(format_number "$retweets")"
+      printf " ${dim}•${reset} ${red}%s${reset} likes" "$(format_number "$likes")"
+      [ "$replies" != "0" ] && printf " ${dim}•${reset} ${blue}%s${reset} replies" "$(format_number "$replies")"
+      printf "\n"
+
+      print_divider
+    done
+}
+
+format_followers() {
+  local response="$1"
+  local count=$(echo "$response" | jq -r '. | length')
+
+  printf "${bold}Users${reset} ${dim}(${yellow}%s${dim} found)${reset}\n" "$count"
+  print_divider
+
+  echo "$response" | jq -r '.[] | "\(.username)|\(.display_name // "N/A")|\(.followers_count // 0)|\(.following_count // 0)|\(.score // "N/A")|\(.verified // false)"' |
+    while IFS="|" read -r username display_name followers following score verified; do
+      printf "\n${bold}@%s${reset}" "$username"
+      [ "$display_name" != "N/A" ] && printf " ${dim}(${blue}%s${reset}${dim})${reset}" "$display_name"
+      [ "$verified" = "true" ] && printf " ${green}✓${reset}"
+      printf "\n"
+
+      printf "  ${cyan}Followers:${reset} ${yellow}%s${reset}" "$(format_number "$followers")"
+      printf " ${dim}•${reset} ${cyan}Following:${reset} ${yellow}%s${reset}" "$(format_number "$following")"
+      [ "$score" != "N/A" ] && printf " ${dim}•${reset} ${cyan}Score:${reset} ${green}%s${reset}" "$score"
+      printf "\n"
+    done
+}
+
+format_score() {
+  local response="$1"
+  local username=$(echo "$response" | jq -r '.username // "N/A"')
+  local score=$(echo "$response" | jq -r '.score // "N/A"')
+  local rank=$(echo "$response" | jq -r '.rank // "N/A"')
+  local classification=$(echo "$response" | jq -r '.classification // "N/A"')
+  local timestamp=$(echo "$response" | jq -r '.timestamp // "N/A"')
+
+  printf "${bold}Score for ${green}@%s${reset}\n" "$username"
+  print_divider
+  print_kv "Score" "${yellow}${score}${reset}"
+  [ "$rank" != "N/A" ] && print_kv "Rank" "${cyan}#$(format_number "$rank")${reset}"
+  [ "$classification" != "N/A" ] && print_kv "Classification" "${magenta}${classification}${reset}"
+  [ "$timestamp" != "N/A" ] && print_kv "Updated" "${dim}$(format_timestamp "$timestamp")${reset}"
+}
+
+format_simple_list() {
+  local response="$1"
+  local title="$2"
+  local count=$(echo "$response" | jq -r '. | length // 0')
+
+  printf "${bold}%s${reset} ${dim}(${yellow}%s${dim} found)${reset}\n" "$title" "$count"
+  print_divider
+
+  echo "$response" | jq -r '.[]' | while read -r item; do
+    printf "${green}%s${reset}\n" "$item"
+  done
+}
+
+format_past_usernames() {
+  local response="$1"
+  local username="$2"
+
+  # extract the data array from the response
+  local data=$(echo "$response" | jq -r '.data // []')
+  local count=$(echo "$data" | jq -r '. | length // 0')
+
+  printf "${bold}Past Usernames for ${green}@%s${reset} ${dim}(${yellow}%s${dim} found)${reset}\n" "$username" "$count"
+  print_divider
+
+  if echo "$data" | jq -e '.[0].username' >/dev/null 2>&1; then
+    echo "$data" | jq -r '.[] | "\(.username)|\(.last_checked // "N/A")"' |
+      while IFS="|" read -r past_username last_checked; do
+        printf "${green}%-20s${reset}" "$past_username"
+        if [ "$last_checked" != "N/A" ]; then
+          printf " ${dim}(last seen: ${yellow}%s${reset}${dim})${reset}" "$(format_timestamp "$last_checked")"
+        fi
+        printf "\n"
+      done
+  else
+    echo "$data" | jq -r '.[]' | while read -r item; do
+      printf "${green}%s${reset}\n" "$item"
+    done
+  fi
+}
+
+validate_required() {
+  local value="$1"
+  local name="$2"
+  if [ -z "$value" ]; then
+    echo "${red}Error:${reset} $name is required." >&2
+    exit 1
+  fi
+}
+
+if [ -z "$argc_command" ]; then
+  show_help
+  exit 0
+fi
+
+case "$argc_command" in
+# Account & Info commands
+account)
+  response=$(make_request "GET" "get_my_account")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_account "$response"
+  ;;
+
+info)
+  response=$(make_request "GET" "info")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || echo "$response" | jq
+  ;;
+
+# Alpha commands
+classification)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  response=$(make_request "POST" "alpha/get_classification" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_score "$response"
+  ;;
+
+score)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  response=$(make_request "POST" "alpha/get_score" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_score "$response"
+  ;;
+
+score-history)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  response=$(make_request "POST" "alpha/get_score_history" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || echo "$response" | jq
+  ;;
+
+# Metadata commands
+bio-history)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  response=$(make_request "POST" "metadata/get_bio_history" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || echo "$response" | jq
+  ;;
+
+current-metadata)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  response=$(make_request "POST" "metadata/get_current_metadata" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_user_metadata "$response"
+  ;;
+
+metadata-history)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  response=$(make_request "POST" "metadata/get_metadata_history" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || echo "$response" | jq
+  ;;
+
+follower-count | following-count | tweet-count)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  case "$argc_command" in
+  follower-count) endpoint="metadata/get_current_num_followers" ;;
+  following-count) endpoint="metadata/get_current_num_following" ;;
+  tweet-count) endpoint="metadata/get_current_num_tweets" ;;
+  esac
+  response=$(make_request "POST" "$endpoint" "$payload")
+  if [ "$argc_json" = 1 ]; then
+    echo "$response" | jq
+  else
+    count=$(echo "$response" | jq -r '. // "N/A"')
+    printf "${bold}%s:${reset} ${yellow}%s${reset}\n" "${argc_command//-/ }" "$(format_number "$count")"
+  fi
+  ;;
+
+latest-metadata)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  response=$(make_request "POST" "metadata/get_latest_metadata" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_user_metadata "$response"
+  ;;
+
+userid)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  response=$(make_request "POST" "metadata/get_userid" "$payload")
+  if [ "$argc_json" = 1 ]; then
+    echo "$response" | jq
+  else
+    userid=$(echo "$response" | jq -r '.userid // "N/A"')
+    printf "${bold}User ID for @%s:${reset} ${cyan}%s${reset}\n" "$argc_value" "$userid"
+  fi
+  ;;
+
+past-usernames)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  response=$(make_request "POST" "metadata/get_past_usernames" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_past_usernames "$response" "$argc_value"
+  ;;
+
+deleted-tweets)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  response=$(make_request "POST" "metadata/get_deleted_tweets" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_tweets "$response"
+  ;;
+
+# Tweet commands
+tweets | latest-tweets)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  endpoint="metadata/get_$([ "$argc_command" = "latest-tweets" ] && echo "latest_" || echo "")tweets"
+  response=$(make_request "POST" "$endpoint" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_tweets "$response"
+  ;;
+
+tweets-by-ids)
+  validate_required "$argc_tweet_ids" "Tweet IDs (use --tweet-ids)"
+  IFS=',' read -ra tweet_array <<<"$argc_tweet_ids"
+  if [ ${#tweet_array[@]} -gt 20 ]; then
+    echo "${red}Error:${reset} Maximum 20 tweet IDs allowed." >&2
+    exit 1
+  fi
+  tweet_ids_json=$(printf '%s\n' "${tweet_array[@]}" | jq -R . | jq -s .)
+  payload="{\"tweet_ids\": $tweet_ids_json}"
+  response=$(make_request "POST" "metadata/get_tweets_by_ids" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_tweets "$response"
+  ;;
+
+# Graph commands
+first-followers | followers | following | scored-followers)
+  validate_required "$argc_value" "Username"
+  payload=$(build_user_payload "$argc_value")
+  endpoint="graph/get_$(echo "$argc_command" | tr '-' '_')"
+  response=$(make_request "POST" "$endpoint" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_followers "$response"
+  ;;
+
+# List commands
+list-members)
+  validate_required "$argc_value" "List ID"
+  payload="{\"list_id\": \"$argc_value\", \"page\": $argc_page}"
+  response=$(make_request "POST" "lists/get_list_members" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_followers "$response"
+  ;;
+
+list-tweets)
+  validate_required "$argc_value" "List ID"
+  payload="{\"list_id\": \"$argc_value\", \"page\": $argc_page}"
+  response=$(make_request "POST" "lists/get_latest_list_tweets" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_tweets "$response"
+  ;;
+
+# Cyclone commands
+cyclone-tweets)
+  # Validate num_rows
+  if [ "$argc_num_rows" -gt 100 ]; then
+    echo "${red}Error:${reset} Maximum 100 rows allowed." >&2
+    exit 1
+  fi
+
+  payload="{\"num_rows\": $argc_num_rows"
+  [ -n "$argc_since" ] && {
+    if [[ "$argc_since" =~ ^[0-9]+$ ]]; then
+      payload="$payload, \"tweets_since\": $argc_since"
+    else
+      payload="$payload, \"users_since\": \"$argc_since\""
+    fi
+  }
+  payload="$payload}"
+  response=$(make_request "POST" "cyclone/get_cyclone_tweets" "$payload")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_tweets "$response"
+  ;;
+
+*)
+  echo "${red}Error:${reset} Unknown command: ${argc_command}" >&2
+  show_help
+  exit 1
+  ;;
+esac
