@@ -413,7 +413,15 @@ format_timestamp() {
       echo "$timestamp"
     fi
   else
-    # ISO date string
+    # ISO date string - try to parse it nicely
+    if command -v date >/dev/null 2>&1; then
+      # Remove timezone info and try to parse
+      local clean_date=$(echo "$timestamp" | sed 's/T/ /' | sed 's/[+-][0-9][0-9]:[0-9][0-9]$//')
+      if date -d "$clean_date" "+%Y-%m-%d %H:%M:%S" 2>/dev/null; then
+        return
+      fi
+    fi
+    # If parsing fails, just return the original
     echo "$timestamp"
   fi
 }
@@ -568,15 +576,17 @@ show_help() {
 
 format_account() {
   local response="$1"
-  local username=$(echo "$response" | jq -r '.username // "N/A"')
-  local credits=$(echo "$response" | jq -r '.credits // "N/A"')
-  local plan=$(echo "$response" | jq -r '.plan // "N/A"')
+  local credits=$(echo "$response" | jq -r '.current_credits // .credits // "N/A"')
+  local subscriptions=$(echo "$response" | jq -r '.subscriptions // [] | length')
 
   printf "${bold}Account Information${reset}\n"
   print_divider
-  print_kv "Username" "${green}${username}${reset}"
   print_kv "Credits" "${yellow}$(format_number "$credits")${reset}"
-  print_kv "Plan" "${cyan}${plan}${reset}"
+  if [ "$subscriptions" -gt 0 ]; then
+    print_kv "Active Subscriptions" "${green}${subscriptions}${reset}"
+  else
+    print_kv "Subscription Status" "${dim}No active subscriptions${reset}"
+  fi
 }
 
 format_user_metadata() {
@@ -609,56 +619,104 @@ format_user_metadata() {
 
 format_tweets() {
   local response="$1"
+  local title="${2:-Tweets}"
   local count=$(echo "$response" | jq -r '. | length')
 
-  printf "${bold}Tweets${reset} ${dim}(${yellow}%s${dim} found)${reset}\n" "$count"
+  printf "${bold}%s${reset} ${dim}(${yellow}%s${dim} found)${reset}\n" "$title" "$count"
   print_divider
 
-  echo "$response" | jq -r '.[] | "\(.id)|\(.text)|\(.created_at)|\(.retweet_count // 0)|\(.favorite_count // 0)|\(.reply_count // 0)"' |
-    while IFS="|" read -r tweet_id text created_at retweets likes replies; do
-      printf "\n${bold}${cyan}%s${reset} ${dim}•${reset} ${yellow}%s${reset}\n" "$tweet_id" "$(format_timestamp "$created_at")"
+  if [ "$count" -eq 0 ]; then
+    printf "${dim}No tweets found${reset}\n"
+    return
+  fi
 
-      # format tweet text with word wrapping
-      printf "%s\n" "$text" | fold -w 80 -s
-
-      printf "\n${dim}Stats:${reset} "
-      printf "${green}%s${reset} retweets" "$(format_number "$retweets")"
-      printf " ${dim}•${reset} ${red}%s${reset} likes" "$(format_number "$likes")"
-      [ "$replies" != "0" ] && printf " ${dim}•${reset} ${blue}%s${reset} replies" "$(format_number "$replies")"
-      printf "\n"
-
-      print_divider
-    done
+  # Process each tweet as a JSON object to handle multi-line text correctly
+  local i=0
+  while [ $i -lt $count ]; do
+    local tweet=$(echo "$response" | jq ".[$i]")
+    
+    local tweet_id=$(echo "$tweet" | jq -r '.id // .tweet_id // "N/A"')
+    local text=$(echo "$tweet" | jq -r '.text // .full_text // .tweet_text // "N/A"')
+    local created_at=$(echo "$tweet" | jq -r '.created_at // .tweet_time // .timestamp // "N/A"')
+    local retweets=$(echo "$tweet" | jq -r '.retweet_count // .retweets // 0')
+    local likes=$(echo "$tweet" | jq -r '.favorite_count // .likes // 0')
+    local replies=$(echo "$tweet" | jq -r '.reply_count // .replies // 0')
+    
+    printf "\n${bold}${cyan}%s${reset} ${dim}•${reset} ${yellow}%s${reset}\n" "$tweet_id" "$(format_timestamp "$created_at")"
+    
+    # format tweet text with word wrapping
+    printf "%s\n" "$text" | fold -w 80 -s
+    
+    printf "\n${dim}Stats:${reset} "
+    printf "${green}%s${reset} retweets" "$(format_number "$retweets")"
+    printf " ${dim}•${reset} ${red}%s${reset} likes" "$(format_number "$likes")"
+    [ "$replies" != "0" ] && [ "$replies" != "N/A" ] && printf " ${dim}•${reset} ${blue}%s${reset} replies" "$(format_number "$replies")"
+    printf "\n"
+    
+    print_divider
+    
+    i=$((i + 1))
+  done
 }
 
 format_followers() {
   local response="$1"
+  local title="${2:-Users}"
   local count=$(echo "$response" | jq -r '. | length')
 
-  printf "${bold}Users${reset} ${dim}(${yellow}%s${dim} found)${reset}\n" "$count"
+  printf "${bold}%s${reset} ${dim}(${yellow}%s${dim} found)${reset}\n" "$title" "$count"
   print_divider
 
-  echo "$response" | jq -r '.[] | "\(.username)|\(.display_name // "N/A")|\(.followers_count // 0)|\(.following_count // 0)|\(.score // "N/A")|\(.verified // false)"' |
-    while IFS="|" read -r username display_name followers following score verified; do
-      printf "\n${bold}@%s${reset}" "$username"
-      [ "$display_name" != "N/A" ] && printf " ${dim}(${blue}%s${reset}${dim})${reset}" "$display_name"
-      [ "$verified" = "true" ] && printf " ${green}✓${reset}"
-      printf "\n"
+  # Check if this is a follower/following response with special structure
+  if echo "$response" | jq -e '.[0].follower_username' >/dev/null 2>&1; then
+    echo "$response" | jq -r '.[] | "\(.follower_username // .username)|\(.follower_bio // .bio // "")|\(.follower_num_followers // .num_followers // 0)|\(.follower_num_friends // .num_friends // 0)|\(.follower_score // .score // "N/A")|\(.follower_account_type_str // .account_type_str // "")"' |
+      while IFS="|" read -r username bio followers following score account_type; do
+        printf "\n${bold}@%s${reset}" "$username"
+        [ -n "$account_type" ] && printf " ${dim}(${magenta}%s${reset}${dim})${reset}" "$account_type"
+        printf "\n"
+        
+        [ -n "$bio" ] && printf "  ${dim}%s${reset}\n" "$(echo "$bio" | fold -w 70 -s | sed '2,$s/^/  /')"
+        
+        printf "  ${cyan}Followers:${reset} ${yellow}%s${reset}" "$(format_number "$followers")"
+        printf " ${dim}•${reset} ${cyan}Following:${reset} ${yellow}%s${reset}" "$(format_number "$following")"
+        [ "$score" != "N/A" ] && printf " ${dim}•${reset} ${cyan}Score:${reset} ${green}%s${reset}" "$score"
+        printf "\n"
+      done
+  else
+    # Standard user list format
+    echo "$response" | jq -r '.[] | "\(.username)|\(.display_name // .bio // "")|\(.followers_count // .num_followers // 0)|\(.following_count // .num_friends // 0)|\(.score // "N/A")|\(.verified // false)"' |
+      while IFS="|" read -r username display_name followers following score verified; do
+        printf "\n${bold}@%s${reset}" "$username"
+        [ -n "$display_name" ] && [ "$display_name" != "N/A" ] && printf " ${dim}(%s)${reset}" "$display_name"
+        [ "$verified" = "true" ] && printf " ${green}✓${reset}"
+        printf "\n"
 
-      printf "  ${cyan}Followers:${reset} ${yellow}%s${reset}" "$(format_number "$followers")"
-      printf " ${dim}•${reset} ${cyan}Following:${reset} ${yellow}%s${reset}" "$(format_number "$following")"
-      [ "$score" != "N/A" ] && printf " ${dim}•${reset} ${cyan}Score:${reset} ${green}%s${reset}" "$score"
-      printf "\n"
-    done
+        printf "  ${cyan}Followers:${reset} ${yellow}%s${reset}" "$(format_number "$followers")"
+        printf " ${dim}•${reset} ${cyan}Following:${reset} ${yellow}%s${reset}" "$(format_number "$following")"
+        [ "$score" != "N/A" ] && printf " ${dim}•${reset} ${cyan}Score:${reset} ${green}%s${reset}" "$score"
+        printf "\n"
+      done
+  fi
 }
 
 format_score() {
   local response="$1"
-  local username=$(echo "$response" | jq -r '.username // "N/A"')
-  local score=$(echo "$response" | jq -r '.score // "N/A"')
-  local rank=$(echo "$response" | jq -r '.rank // "N/A"')
-  local classification=$(echo "$response" | jq -r '.classification // "N/A"')
-  local timestamp=$(echo "$response" | jq -r '.timestamp // "N/A"')
+  
+  # Check if response has data array
+  if echo "$response" | jq -e '.data[0]' >/dev/null 2>&1; then
+    local data=$(echo "$response" | jq '.data[0]')
+    local username=$(echo "$data" | jq -r '.username // "N/A"')
+    local score=$(echo "$data" | jq -r '.score // "N/A"')
+    local rank=$(echo "$data" | jq -r '.rank // "N/A"')
+    local classification=$(echo "$data" | jq -r '.classification // "N/A"')
+    local timestamp=$(echo "$data" | jq -r '.timestamp // "N/A"')
+  else
+    local username=$(echo "$response" | jq -r '.username // "N/A"')
+    local score=$(echo "$response" | jq -r '.score // "N/A"')
+    local rank=$(echo "$response" | jq -r '.rank // "N/A"')
+    local classification=$(echo "$response" | jq -r '.classification // "N/A"')
+    local timestamp=$(echo "$response" | jq -r '.timestamp // "N/A"')
+  fi
 
   printf "${bold}Score for ${green}@%s${reset}\n" "$username"
   print_divider
@@ -708,6 +766,81 @@ format_past_usernames() {
   fi
 }
 
+format_bio_history() {
+  local response="$1"
+  local username="$2"
+  local count=$(echo "$response" | jq -r '. | length // 0')
+
+  printf "${bold}Bio History for ${green}@%s${reset} ${dim}(${yellow}%s${dim} entries)${reset}\n" "$username" "$count"
+  print_divider
+
+  echo "$response" | jq -r '.[] | "\(.bio // "N/A")|\(.timestamp // "N/A")"' |
+    while IFS="|" read -r bio timestamp; do
+      printf "\n${yellow}%s${reset}\n" "$(format_timestamp "$timestamp")"
+      printf "%s\n" "$bio" | fold -w 80 -s
+      print_divider
+    done
+}
+
+format_metadata_history() {
+  local response="$1"
+  local username="$2"
+  local count=$(echo "$response" | jq -r '. | length // 0')
+
+  printf "${bold}Metadata History for ${green}@%s${reset} ${dim}(${yellow}%s${dim} entries)${reset}\n" "$username" "$count"
+  print_divider
+
+  echo "$response" | jq -r '.[] | @base64' |
+    while read -r entry; do
+      local decoded=$(echo "$entry" | base64 -d)
+      local display_name=$(echo "$decoded" | jq -r '.display_name // "N/A"')
+      local bio=$(echo "$decoded" | jq -r '.bio // "N/A"')
+      local followers=$(echo "$decoded" | jq -r '.followers_count // "N/A"')
+      local following=$(echo "$decoded" | jq -r '.following_count // "N/A"')
+      local tweets=$(echo "$decoded" | jq -r '.tweets_count // "N/A"')
+      local timestamp=$(echo "$decoded" | jq -r '.timestamp // "N/A"')
+
+      printf "\n${yellow}%s${reset}\n" "$(format_timestamp "$timestamp")"
+      [ "$display_name" != "N/A" ] && print_kv "Display Name" "$display_name"
+      [ "$bio" != "N/A" ] && print_kv "Bio" "$bio"
+      printf "  ${cyan}Followers:${reset} ${yellow}%s${reset}" "$(format_number "$followers")"
+      printf " ${dim}•${reset} ${cyan}Following:${reset} ${yellow}%s${reset}" "$(format_number "$following")"
+      printf " ${dim}•${reset} ${cyan}Tweets:${reset} ${yellow}%s${reset}\n" "$(format_number "$tweets")"
+      print_divider
+    done
+}
+
+format_score_history() {
+  local response="$1"
+  local username="$2"
+  local count=$(echo "$response" | jq -r '. | length // 0')
+
+  printf "${bold}Score History for ${green}@%s${reset} ${dim}(${yellow}%s${dim} entries)${reset}\n" "$username" "$count"
+  print_divider
+
+  echo "$response" | jq -r '.[] | "\(.score // "N/A")|\(.rank // "N/A")|\(.classification // "N/A")|\(.timestamp // "N/A")"' |
+    while IFS="|" read -r score rank classification timestamp; do
+      printf "\n${yellow}%s${reset}\n" "$(format_timestamp "$timestamp")"
+      printf "  ${cyan}Score:${reset} ${yellow}%s${reset}" "$score"
+      [ "$rank" != "N/A" ] && printf " ${dim}•${reset} ${cyan}Rank:${reset} ${yellow}#%s${reset}" "$(format_number "$rank")"
+      [ "$classification" != "N/A" ] && printf " ${dim}•${reset} ${cyan}Class:${reset} ${magenta}%s${reset}" "$classification"
+      printf "\n"
+    done
+}
+
+format_info() {
+  local response="$1"
+  local version=$(echo "$response" | jq -r '.api_version // .version // "N/A"')
+  local release_date=$(echo "$response" | jq -r '.release_date // "N/A"')
+  local message=$(echo "$response" | jq -r '.message // "N/A"')
+
+  printf "${bold}TOTO API Information${reset}\n"
+  print_divider
+  print_kv "API Version" "${cyan}${version}${reset}"
+  [ "$release_date" != "N/A" ] && print_kv "Release Date" "${yellow}${release_date}${reset}"
+  [ "$message" != "N/A" ] && print_kv "Message" "${green}${message}${reset}"
+}
+
 validate_required() {
   local value="$1"
   local name="$2"
@@ -731,7 +864,7 @@ account)
 
 info)
   response=$(make_request "GET" "info")
-  [ "$argc_json" = 1 ] && echo "$response" | jq || echo "$response" | jq
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_info "$response"
   ;;
 
 # Alpha commands
@@ -739,7 +872,22 @@ classification)
   validate_required "$argc_value" "Username"
   payload=$(build_user_payload "$argc_value")
   response=$(make_request "POST" "alpha/get_classification" "$payload")
-  [ "$argc_json" = 1 ] && echo "$response" | jq || format_score "$response"
+  if [ "$argc_json" = 1 ]; then
+    echo "$response" | jq
+  else
+    # Check if response has data array for classification
+    if echo "$response" | jq -e '.data[0]' >/dev/null 2>&1; then
+      data=$(echo "$response" | jq '.data[0]')
+      username=$(echo "$data" | jq -r '.username // "N/A"')
+      classification=$(echo "$data" | jq -r '.classification // "N/A"')
+      
+      printf "${bold}Classification for ${green}@%s${reset}\n" "$username"
+      print_divider
+      print_kv "Classification" "${magenta}${classification}${reset}"
+    else
+      format_score "$response"
+    fi
+  fi
   ;;
 
 score)
@@ -753,7 +901,7 @@ score-history)
   validate_required "$argc_value" "Username"
   payload=$(build_user_payload "$argc_value")
   response=$(make_request "POST" "alpha/get_score_history" "$payload")
-  [ "$argc_json" = 1 ] && echo "$response" | jq || echo "$response" | jq
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_score_history "$response" "$argc_value"
   ;;
 
 # Metadata commands
@@ -761,7 +909,7 @@ bio-history)
   validate_required "$argc_value" "Username"
   payload=$(build_user_payload "$argc_value")
   response=$(make_request "POST" "metadata/get_bio_history" "$payload")
-  [ "$argc_json" = 1 ] && echo "$response" | jq || echo "$response" | jq
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_bio_history "$response" "$argc_value"
   ;;
 
 current-metadata)
@@ -775,23 +923,40 @@ metadata-history)
   validate_required "$argc_value" "Username"
   payload=$(build_user_payload "$argc_value")
   response=$(make_request "POST" "metadata/get_metadata_history" "$payload")
-  [ "$argc_json" = 1 ] && echo "$response" | jq || echo "$response" | jq
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_metadata_history "$response" "$argc_value"
   ;;
 
 follower-count | following-count | tweet-count)
   validate_required "$argc_value" "Username"
   payload=$(build_user_payload "$argc_value")
   case "$argc_command" in
-  follower-count) endpoint="metadata/get_current_num_followers" ;;
-  following-count) endpoint="metadata/get_current_num_following" ;;
-  tweet-count) endpoint="metadata/get_current_num_tweets" ;;
+  follower-count) 
+    endpoint="metadata/get_current_num_followers"
+    field="num_followers"
+    ;;
+  following-count) 
+    endpoint="metadata/get_current_num_following"
+    field="num_following"
+    ;;
+  tweet-count) 
+    endpoint="metadata/get_current_num_tweets"
+    field="num_tweets"
+    ;;
   esac
   response=$(make_request "POST" "$endpoint" "$payload")
   if [ "$argc_json" = 1 ]; then
     echo "$response" | jq
   else
-    count=$(echo "$response" | jq -r '. // "N/A"')
-    printf "${bold}%s:${reset} ${yellow}%s${reset}\n" "${argc_command//-/ }" "$(format_number "$count")"
+    # Check if response has data array
+    if echo "$response" | jq -e '.data[0]' >/dev/null 2>&1; then
+      count=$(echo "$response" | jq -r ".data[0].$field // \"N/A\"")
+      username=$(echo "$response" | jq -r '.data[0].username // "N/A"')
+    else
+      count=$(echo "$response" | jq -r ". // \"N/A\"")
+      username="$argc_value"
+    fi
+    label=$(echo "${argc_command//-/ }" | sed 's/\b\(.\)/\u\1/g')
+    printf "${bold}%s for ${green}@%s${reset}: ${yellow}%s${reset}\n" "$label" "$username" "$(format_number "$count")"
   fi
   ;;
 
@@ -825,7 +990,17 @@ deleted-tweets)
   validate_required "$argc_value" "Username"
   payload=$(build_user_payload "$argc_value")
   response=$(make_request "POST" "metadata/get_deleted_tweets" "$payload")
-  [ "$argc_json" = 1 ] && echo "$response" | jq || format_tweets "$response"
+  if [ "$argc_json" = 1 ]; then
+    echo "$response" | jq
+  else
+    # Check if response is wrapped in data field
+    if echo "$response" | jq -e '.data' >/dev/null 2>&1; then
+      data=$(echo "$response" | jq '.data')
+      format_tweets "$data" "Deleted Tweets for @$argc_value"
+    else
+      format_tweets "$response" "Deleted Tweets for @$argc_value"
+    fi
+  fi
   ;;
 
 # Tweet commands
@@ -834,7 +1009,17 @@ tweets | latest-tweets)
   payload=$(build_user_payload "$argc_value")
   endpoint="metadata/get_$([ "$argc_command" = "latest-tweets" ] && echo "latest_" || echo "")tweets"
   response=$(make_request "POST" "$endpoint" "$payload")
-  [ "$argc_json" = 1 ] && echo "$response" | jq || format_tweets "$response"
+  if [ "$argc_json" = 1 ]; then
+    echo "$response" | jq
+  else
+    # Check if response has data array
+    if echo "$response" | jq -e '.data' >/dev/null 2>&1; then
+      data=$(echo "$response" | jq '.data')
+      format_tweets "$data" "Tweets for @$argc_value"
+    else
+      format_tweets "$response" "Tweets for @$argc_value"
+    fi
+  fi
   ;;
 
 tweets-by-ids)
@@ -856,7 +1041,23 @@ first-followers | followers | following | scored-followers)
   payload=$(build_user_payload "$argc_value")
   endpoint="graph/get_$(echo "$argc_command" | tr '-' '_')"
   response=$(make_request "POST" "$endpoint" "$payload")
-  [ "$argc_json" = 1 ] && echo "$response" | jq || format_followers "$response"
+  if [ "$argc_json" = 1 ]; then
+    echo "$response" | jq
+  else
+    # Check if response has data array
+    if echo "$response" | jq -e '.data' >/dev/null 2>&1; then
+      data=$(echo "$response" | jq '.data')
+      case "$argc_command" in
+        first-followers) title="First Followers of @$argc_value" ;;
+        followers) title="Followers of @$argc_value" ;;
+        following) title="Following by @$argc_value" ;;
+        scored-followers) title="Scored Followers of @$argc_value" ;;
+      esac
+      format_followers "$data" "$title"
+    else
+      format_followers "$response" "Users"
+    fi
+  fi
   ;;
 
 # List commands
